@@ -120,19 +120,27 @@ class RuntimeState:
             return 503, "; ".join(issues)
 
 
-def send_telegram(text: str, token: str, chat_id: str) -> bool:
-    """Send a message to Telegram with retry on transient errors."""
+def _split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """Split text into chunks that fit Telegram's character limit, breaking at newlines."""
+    if len(text) <= limit:
+        return [text]
+
+    parts: list[str] = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return parts
+
+
+def _send_one(payload: dict, token: str) -> bool:
+    """Send a single Telegram message with retry."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-
-    if len(text) > TELEGRAM_MAX_CHARS:
-        text = text[: TELEGRAM_MAX_CHARS - 18] + "\n\n... [truncated]"
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
 
     for attempt in range(TELEGRAM_MAX_RETRIES):
         try:
@@ -167,6 +175,24 @@ def send_telegram(text: str, token: str, chat_id: str) -> bool:
 
     print("Telegram send failed after retries", file=sys.stderr)
     return False
+
+
+def send_telegram(text: str, token: str, chat_id: str) -> bool:
+    """Send a message to Telegram, splitting long messages and using Markdown."""
+    parts = _split_message(text)
+    ok = True
+    for part in parts:
+        payload = {
+            "chat_id": chat_id,
+            "text": part,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        if not _send_one(payload, token):
+            ok = False
+        if len(parts) > 1:
+            time.sleep(0.5)
+    return ok
 
 
 async def query_agent(client: anthropic.AsyncAnthropic, agent_id: str, env_id: str, prompt: str) -> str:
