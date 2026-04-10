@@ -1,8 +1,7 @@
-"""Query an Anthropic managed agent and forward the reply to Telegram.
+"""Long-running Telegram bot that routes messages to an Anthropic managed agent.
 
-Usage:
-    python managed_agent_client.py                          # uses AGENT_PROMPT env var
-    python managed_agent_client.py "summarise the market"   # one-shot prompt
+Send any message to the bot in Telegram and it forwards it to the managed agent,
+then sends the agent's reply back to you.
 
 Required env vars:
     ANTHROPIC_API_KEY
@@ -12,7 +11,7 @@ Required env vars:
 Optional env vars:
     MANAGED_AGENT_ID   (default: agent_011CZvYHX9XjGTQAv7XnV87c)
     MANAGED_ENV_ID     (default: env_018YG4QFkAZrNuUbat2RC6XU)
-    AGENT_PROMPT       (default prompt when no CLI arg given)
+    PORT               (default: 8080, for health check)
 """
 
 from __future__ import annotations
@@ -21,6 +20,8 @@ import asyncio
 import os
 import sys
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Thread
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -33,10 +34,10 @@ BETAS = ["managed-agents-2026-04-01"]
 
 DEFAULT_AGENT_ID = "agent_011CZvYHX9XjGTQAv7XnV87c"
 DEFAULT_ENV_ID = "env_018YG4QFkAZrNuUbat2RC6XU"
-DEFAULT_PROMPT = "Give me a morning market briefing. Cover major index moves, sector rotation, notable pre-market movers, and any macro catalysts for today."
 
 TELEGRAM_MAX_CHARS = 4096
 TELEGRAM_MAX_RETRIES = 3
+POLL_INTERVAL = 2
 
 
 def _get_required_env(name: str) -> str:
@@ -99,7 +100,7 @@ async def query_agent(client: anthropic.AsyncAnthropic, agent_id: str, env_id: s
         environment_id=env_id,
         betas=BETAS,
     )
-    print(f"Session: {session.id}")
+    print(f"  session: {session.id}")
 
     chunks: list[str] = []
 
@@ -119,43 +120,109 @@ async def query_agent(client: anthropic.AsyncAnthropic, agent_id: str, env_id: s
             if event.type == "agent.message":
                 for block in event.content:
                     if hasattr(block, "text"):
-                        print(block.text, end="", flush=True)
                         chunks.append(block.text)
             elif event.type == "agent.tool_use":
-                print(f"\n  [tool] {event.name}", flush=True)
+                print(f"  [tool] {event.name}", flush=True)
             elif event.type == "session.status_idle":
                 break
             elif event.type == "error":
-                print(f"\n[error] {event}", file=sys.stderr)
-                raise SystemExit(1)
+                print(f"  [error] {event}", file=sys.stderr)
+                return f"Agent error: {event}"
     finally:
         await stream.close()
 
-    print()
     return "".join(chunks)
+
+
+def poll_telegram_updates(token: str, chat_id: str, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    """Long-poll Telegram for new messages and push them onto the async queue."""
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    offset = 0
+
+    print(f"Polling Telegram for messages (chat_id={chat_id})...")
+
+    while True:
+        try:
+            resp = requests.get(url, params={"offset": offset, "timeout": 30}, timeout=35)
+            if not resp.ok:
+                print(f"Telegram poll error: {resp.status_code}", file=sys.stderr)
+                time.sleep(5)
+                continue
+
+            for update in resp.json().get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                text = msg.get("text", "").strip()
+                sender_chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if not text or sender_chat_id != chat_id:
+                    continue
+
+                print(f"[msg] {text[:80]}")
+                loop.call_soon_threadsafe(queue.put_nowait, text)
+
+        except requests.RequestException as exc:
+            print(f"Telegram poll failed: {exc}", file=sys.stderr)
+            time.sleep(5)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass
+
+
+def start_health_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health server on :{port}")
 
 
 async def main() -> None:
     token = _get_required_env("TELEGRAM_BOT_TOKEN")
     chat_id = _get_required_env("TELEGRAM_CHAT_ID")
-
     agent_id = os.getenv("MANAGED_AGENT_ID", DEFAULT_AGENT_ID)
     env_id = os.getenv("MANAGED_ENV_ID", DEFAULT_ENV_ID)
-    prompt = sys.argv[1] if len(sys.argv) > 1 else os.getenv("AGENT_PROMPT", DEFAULT_PROMPT)
+
+    start_health_server()
 
     client = anthropic.AsyncAnthropic()
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-    print(f"Prompt: {prompt}")
-    reply = await query_agent(client, agent_id, env_id, prompt)
+    poll_thread = Thread(
+        target=poll_telegram_updates,
+        args=(token, chat_id, queue, loop),
+        daemon=True,
+    )
+    poll_thread.start()
 
-    if not reply.strip():
-        print("Agent returned empty response, skipping Telegram.")
-        raise SystemExit(1)
+    print("Ready — send a message in Telegram.\n")
 
-    header = f"<b>Agent Briefing</b>\n\n"
-    ok = send_telegram(header + reply, token, chat_id)
-    print("Telegram: sent" if ok else "Telegram: FAILED")
-    raise SystemExit(0 if ok else 1)
+    while True:
+        text = await queue.get()
+
+        send_telegram("⏳ Thinking...", token, chat_id)
+
+        try:
+            reply = await query_agent(client, agent_id, env_id, text)
+        except Exception as exc:
+            print(f"Agent error: {exc}", file=sys.stderr)
+            send_telegram(f"Error: {exc}", token, chat_id)
+            continue
+
+        if not reply.strip():
+            send_telegram("Agent returned an empty response.", token, chat_id)
+            continue
+
+        send_telegram(reply, token, chat_id)
+        print(f"  replied ({len(reply)} chars)")
 
 
 if __name__ == "__main__":

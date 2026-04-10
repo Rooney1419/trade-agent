@@ -5,6 +5,7 @@
   },
   "deploy": {
     "startCommand": "python -u managed_agent_client.py",
-    "cronSchedule": "0 14 * * 1-5"
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 120
   }
 }
