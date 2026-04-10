@@ -22,6 +22,10 @@ import os
 import sys
 import time
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import anthropic
 import requests
 
@@ -99,16 +103,18 @@ async def query_agent(client: anthropic.AsyncAnthropic, agent_id: str, env_id: s
 
     chunks: list[str] = []
 
-    async with client.beta.sessions.events.stream(session.id, betas=BETAS) as stream:
-        await client.beta.sessions.events.send(
-            session.id,
-            events=[{
-                "type": "user.message",
-                "content": [{"type": "text", "text": prompt}],
-            }],
-            betas=BETAS,
-        )
+    stream = await client.beta.sessions.events.stream(session.id, betas=BETAS)
 
+    await client.beta.sessions.events.send(
+        session.id,
+        events=[{
+            "type": "user.message",
+            "content": [{"type": "text", "text": prompt}],
+        }],
+        betas=BETAS,
+    )
+
+    try:
         async for event in stream:
             if event.type == "agent.message":
                 for block in event.content:
@@ -122,6 +128,8 @@ async def query_agent(client: anthropic.AsyncAnthropic, agent_id: str, env_id: s
             elif event.type == "error":
                 print(f"\n[error] {event}", file=sys.stderr)
                 raise SystemExit(1)
+    finally:
+        await stream.close()
 
     print()
     return "".join(chunks)
